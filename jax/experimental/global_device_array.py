@@ -13,7 +13,7 @@
 # limitations under the License.
 """Implementation of GlobalDeviceArray."""
 
-from collections import defaultdict, Counter
+from collections import Counter
 import dataclasses
 import numpy as np
 from typing import Callable, Sequence, Tuple, Union, Mapping, Optional, List, Dict, NamedTuple
@@ -25,6 +25,7 @@ from jax._src.lib import xla_client as xc
 from jax.interpreters import pxla, xla
 from jax._src.util import prod, safe_zip
 from jax._src.api import device_put
+from jax.tree_util import tree_map
 from jax.interpreters.sharded_jit import PartitionSpec
 
 Shape = Tuple[int, ...]
@@ -33,17 +34,6 @@ DeviceArray = xc.Buffer
 Device = xc.Device
 ArrayLike = Union[np.ndarray, DeviceArray]
 Index = Tuple[slice, ...]
-
-
-@dataclasses.dataclass(frozen=True)
-class _HashableIndex:
-  val: Index
-
-  def __hash__(self):
-    return hash(tuple((v.start, v.stop, v.step) for v in self.val))
-
-  def __eq__(self, other):
-    return self.val == other.val
 
 
 def _get_indices(global_shape: Shape, global_mesh: pxla.Mesh,
@@ -78,14 +68,16 @@ def get_shard_indices(global_shape: Shape, global_mesh: pxla.Mesh,
       for d, i in safe_zip(global_mesh.devices.flat, indices))  # type: ignore
 
 
+_hashed_index = lambda x: hash(tuple((v.start, v.stop) for v in x))
+
 def get_shard_indices_replica_ids(
     global_shape: Shape, global_mesh: pxla.Mesh,
     mesh_axes: MeshAxes) -> Mapping[Device, Tuple[Index, int]]:
   indices = _get_indices(global_shape, global_mesh, mesh_axes)
-  index_to_replica: Dict[_HashableIndex, int] = Counter()
+  index_to_replica: Dict[int, int] = Counter()
   out = {}
   for device, index in safe_zip(global_mesh.devices.flat, indices):
-    h_index = _HashableIndex(index)
+    h_index = _hashed_index(index)
     replica_id = index_to_replica[h_index]
     index_to_replica[h_index] += 1
     out[device] = (index, replica_id)
@@ -107,8 +99,7 @@ def get_shard_shape(global_shape, global_mesh, mesh_axes) -> Shape:
   return tuple(chunk_size)
 
 
-@dataclasses.dataclass(frozen=True)
-class Shard:
+class Shard(NamedTuple):
   """A single data shard of a GlobalDeviceArray.
 
   Attributes:
@@ -243,13 +234,14 @@ class GlobalDeviceArray:
     # Optionally precomputed for performance.
     self._gda_fast_path_args = _gda_fast_path_args
     self._current_process = xb.process_index()
-    self._local_shards = self._create_local_shards()
 
     if self._gda_fast_path_args is None:
-      local_devices = self._global_mesh.local_devices
+      self._local_devices = self._global_mesh.local_devices
     else:
-      local_devices = self._gda_fast_path_args.local_devices
-    assert len(device_buffers) == len(local_devices)
+      self._local_devices = self._gda_fast_path_args.local_devices
+    assert len(device_buffers) == len(self._local_devices)
+
+    self._local_shards = self._create_local_shards()
 
     ss = get_shard_shape(self._global_shape, self._global_mesh, self._mesh_axes)
     assert all(db.shape == ss for db in device_buffers), (
@@ -285,7 +277,7 @@ class GlobalDeviceArray:
       global_indices_rid = get_shard_indices_replica_ids(
         self._global_shape, self._global_mesh, self._mesh_axes)
       local_idx_rid = dict((d, global_indices_rid[d])
-                           for d in self._global_mesh.local_devices)
+                           for d in self._local_devices)
     device_to_buffer = dict((db.device(), db) for db in self._device_buffers)
     return [
         Shard(d, index, rid, device_to_buffer[d])
@@ -373,13 +365,17 @@ class GlobalDeviceArray:
         global_shape, global_mesh, mesh_axes)
     local_devices = global_mesh.local_devices
 
-    index_to_device: Mapping[_HashableIndex, List[Device]] = defaultdict(list)
+    index_to_device: Dict[int, Tuple[Index, List[Device]]] = {}
     for device in local_devices:
-      h_index = _HashableIndex(global_indices_rid[device][0])
-      index_to_device[h_index].append(device)
+      index = global_indices_rid[device][0]
+      h_index = _hashed_index(index)
+      if h_index not in index_to_device:
+        index_to_device[h_index] = (index, [device])
+      else:
+        index_to_device[h_index][1].append(device)
 
     cb_inp = [
-        (index.val, tuple(devices)) for index, devices in index_to_device.items()
+        (index, tuple(devices)) for index, devices in index_to_device.values()
     ]
     dbs = data_callback(cb_inp)
     local_idx_rid = dict((d, global_indices_rid[d]) for d in local_devices)
